@@ -1,0 +1,1 @@
+This repository contains the metadata of final subsampled dataset which is restricted to whole genomes only. Up to three sequences selected per group with group being: year of isolation, major lineage, and country, with up to three sequences selected per group
