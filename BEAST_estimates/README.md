@@ -1,0 +1,1 @@
+This folder contains all the results from the BEAST analyses for each serotype: This was perform at full genome level at serotype, genotype and major lineage, as well as for protein-level estimate only at serotype level.
