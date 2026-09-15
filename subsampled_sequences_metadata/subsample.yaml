@@ -1,0 +1,7 @@
+subsampling:
+  lineage_country_year:
+    group_by:
+      - "major_lineage"
+      - "country"
+      - "year"
+    max_sequences: 3
