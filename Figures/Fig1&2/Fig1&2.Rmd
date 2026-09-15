@@ -1,0 +1,1948 @@
+---
+title: "DENV Evolutionary Rate Analysis with Summary Plot"
+author: "Afeez"
+date: "`04-16-26`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# install.packages(c("readxl", "dplyr", "tidyr", "stringr", "ggplot2", "forcats", "scales", "patchwork"))
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(forcats)
+library(scales)
+library(patchwork)
+# Use + theme_manuscript on all plots before combining
+
+# Increase spacing between combined panels so x-axis labels
+# from adjacent plots do not visually merge together.
+# Example:
+# combined_plot <- (plot1 / plot2 / plot3) +
+#   plot_layout(heights = c(1, 1, 1)) +
+#   plot_annotation(tag_levels = "a")
+
+library(readr)
+library(purrr)
+library(tibble)
+
+# Shared DENV serotype colors used across all evolutionary-rate plots
+serotype_colors <- c(
+  "DENV1" = "#227DCB",
+  "DENV2" = "#b020e0",
+  "DENV3" = "#ffce9d",
+  "DENV4" = "#954226"
+)
+
+serotype_labels <- c(
+  "DENV1" = "DENV-1",
+  "DENV2" = "DENV-2",
+  "DENV3" = "DENV-3",
+  "DENV4" = "DENV-4"
+)
+
+# Log-scale axis used across evolutionary-rate plots.
+# Starts at 1e-4 and includes intermediate ticks where these rate estimates cluster.
+rate_log_breaks <- c(1e-4, 2e-4, 3e-4, 5e-4, 7e-4, 1e-3, 2e-3, 3e-3, 5e-3, 1e-2)
+rate_log_labels <- scales::label_scientific(digits = 1)
+
+
+
+# =========================================================
+# Shared manuscript theme for all combined figures
+# =========================================================
+
+theme_manuscript <- theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_blank(),
+
+    axis.title = element_text(size = 12),
+    axis.text  = element_text(size = 11),
+
+    strip.text = element_text(size = 11, face = "bold"),
+
+    plot.tag = element_text(
+      size = 15,
+      face = "bold"
+    ),
+
+    plot.tag.position = c(0.01, 0.98),
+
+    panel.grid.minor = element_blank(),
+
+    plot.margin = margin(15, 10, 15, 10)
+  )
+
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Overview
+
+This document parses BEAST/Tracer-style summary sheets from the workbook and performs a protein-level comparison of evolutionary rates across all four dengue serotypes. The analysis uses the following sheets:
+
+- `DENV1_Proteins`
+- `DENV2_Proteins`
+- `DENV3_Proteins`
+- `DENV4_Proteins`
+
+The main figure compares the **mean evolutionary rate** and **95% HPD interval** for each protein:
+
+- C
+- P
+- E
+- NS1
+- NS2A
+- NS2B
+- NS3
+- NS4A
+- NS4B
+- NS5
+
+# File path
+
+Update this path if your Excel file is stored somewhere else.
+
+```{r file-path}
+file_path <- "~/Desktop/DENV_EVO_2025/2026.03.25_all_evo_rates.xlsx"
+```
+
+# Helper functions
+
+```{r helpers}
+# Parse one BEAST/Tracer-style sheet
+parse_rate_sheet <- function(file_path, sheet_name, group_col_name) {
+  raw <- read_excel(file_path, sheet = sheet_name, col_names = TRUE)
+  names(raw)[1] <- "metric"
+  
+  long_df <- raw %>%
+    pivot_longer(cols = -metric, names_to = group_col_name, values_to = "value")
+  
+  median_df <- long_df %>%
+    filter(metric == "median") %>%
+    mutate(median = as.numeric(value)) %>%
+    select(all_of(group_col_name), median)
+  
+  mean_df <- long_df %>%
+    filter(metric == "mean") %>%
+    mutate(mean = as.numeric(value)) %>%
+    select(all_of(group_col_name), mean)
+  
+  hpd_df <- long_df %>%
+    filter(metric == "95% HPD interval") %>%
+    mutate(
+      value     = as.character(value),
+      hpd_lower = as.numeric(str_match(value, "\\[([^,]+),")[, 2]),
+      hpd_upper = as.numeric(str_match(value, ",\\s*([^\\]]+)\\]")[, 2])
+    ) %>%
+    select(all_of(group_col_name), hpd_lower, hpd_upper)
+  
+  ess_df <- long_df %>%
+    filter(metric == "effective sample size (ESS)") %>%
+    mutate(ESS = as.numeric(value)) %>%
+    select(all_of(group_col_name), ESS)
+  
+  median_df %>%
+    left_join(mean_df, by = group_col_name) %>%
+    left_join(hpd_df,  by = group_col_name) %>%
+    left_join(ess_df,  by = group_col_name)
+}
+
+# Clean BEAST protein labels so plotting uses shared protein names
+clean_protein_name <- function(x) {
+  x %>%
+    str_replace("^D[1-4]_", "") %>%
+    str_replace("^Capsid$", "C") %>%
+    str_replace("^Envelope$", "E")
+}
+```
+
+# Protein-level analysis across DENV1 to DENV4
+
+## Import and combine protein sheets
+
+```{r protein-data}
+protein_df <- bind_rows(
+  parse_rate_sheet(file_path, "DENV1_Proteins", "protein_raw") %>% mutate(serotype = "DENV1"),
+  parse_rate_sheet(file_path, "DENV2_Proteins", "protein_raw") %>% mutate(serotype = "DENV2"),
+  parse_rate_sheet(file_path, "DENV3_Proteins", "protein_raw") %>% mutate(serotype = "DENV3"),
+  parse_rate_sheet(file_path, "DENV4_Proteins", "protein_raw") %>% mutate(serotype = "DENV4")
+) %>%
+  mutate(
+    protein = clean_protein_name(as.character(protein_raw)),
+    serotype = factor(serotype, levels = c("DENV1", "DENV2", "DENV3", "DENV4")),
+    protein = factor(protein, levels = c("C", "PrM", "E", "NS1", "NS2A", "NS2B", "NS3", "NS4A", "NS4B", "NS5"))
+  ) %>%
+  mutate(
+    mean = suppressWarnings(as.numeric(mean)),
+    median = suppressWarnings(as.numeric(median)),
+    hpd_lower = suppressWarnings(as.numeric(hpd_lower)),
+    hpd_upper = suppressWarnings(as.numeric(hpd_upper)),
+    ESS = suppressWarnings(as.numeric(ESS))
+  )
+
+protein_df
+```
+
+## Keep plottable values only
+
+This step removes rows where the mean or HPD values are missing or non-finite.
+
+```{r protein-clean}
+protein_plot_df <- protein_df %>%
+  filter(
+    !is.na(protein),
+    is.finite(mean),
+    is.finite(hpd_lower),
+    is.finite(hpd_upper)
+  )
+
+protein_plot_df
+```
+
+## Quick summary table
+
+```{r protein-summary}
+protein_summary <- protein_plot_df %>%
+  arrange(protein, serotype) %>%
+  select(serotype, protein, mean, hpd_lower, hpd_upper, ESS)
+
+knitr::kable(protein_summary, digits = 6)
+```
+
+## Plot mean and 95% HPD for all proteins across serotypes
+
+By default, this uses a log10 y-axis starting at 1e-4 with intermediate breaks. The original x10^-4 axis is retained below as a commented option.
+
+```{r}
+# =========================================================
+# Shared Y-axis for protein plots
+# Default: log10 scale with intermediate ticks starting at 1e-4.
+# Optional x10^-4 scale is included below and commented out.
+# =========================================================
+protein_y_min <- 1e-4
+protein_y_max <- max(protein_plot_df$hpd_upper, na.rm = TRUE)
+
+protein_y <- scale_y_log10(
+  limits = c(protein_y_min, protein_y_max),
+  breaks = rate_log_breaks,
+  labels = rate_log_labels,
+  expand = expansion(mult = c(0.02, 0.08))
+)
+
+protein_y_label <- expression(
+  atop(
+    bold("Evolutionary rate"),
+    bold("(s/s/y, log scale)")
+  )
+)
+
+# ---- Optional x10^-4 scale ----
+# To use this instead, comment out the protein_y and protein_y_label above,
+# then uncomment this block.
+# protein_y_min_x10_4 <- floor(min(protein_plot_df$hpd_lower, na.rm = TRUE) * 1e4)
+# protein_y_max_x10_4 <- ceiling(max(protein_plot_df$hpd_upper, na.rm = TRUE) * 1e4)
+#
+# protein_y <- scale_y_continuous(
+#   limits = c(protein_y_min_x10_4 / 1e4, protein_y_max_x10_4 / 1e4),
+#   breaks = seq(protein_y_min_x10_4, protein_y_max_x10_4, by = 1) / 1e4,
+#   labels = function(x) x * 1e4,
+#   expand = expansion(mult = c(0.02, 0.08))
+# )
+#
+# protein_y_label <- expression("Evolutionary rate (" %*% 10^-4 * " subs/site/year)")
+```
+
+
+
+
+####Faceting by protein
+```{r protein-by-protein-one-row, fig.width=18, fig.height=4.5}
+# =========================================================
+# 7) Protein-specific evolutionary rates by serotype
+# =========================================================
+
+serotype_labels <- c(
+  "DENV1" = "DENV-1",
+  "DENV2" = "DENV-2",
+  "DENV3" = "DENV-3",
+  "DENV4" = "DENV-4"
+)
+
+protein_plot_df <- protein_plot_df %>%
+  mutate(
+    protein = factor(
+      protein,
+      levels = c(
+        "C", "PrM", "E", "NS1", "NS2A",
+        "NS2B", "NS3", "NS4A", "NS4B", "NS5"
+      ),
+      labels = c(
+        "C", "PrM", "E", "NS1", "NS2A",
+        "NS2B", "NS3", "NS4A", "NS4B", "NS5"
+      )
+    ),
+    serotype = factor(
+      serotype,
+      levels = c("DENV1", "DENV2", "DENV3", "DENV4")
+    )
+  )
+
+pd_serotype <- position_dodge(width = 0.65)
+
+p_serotype_by_protein <- ggplot(
+  protein_plot_df,
+  aes(
+    x = protein,
+    y = mean,
+    color = serotype,
+    fill = serotype
+  )
+) +
+  geom_errorbar(
+    aes(
+      ymin = hpd_lower,
+      ymax = hpd_upper
+    ),
+    color = "black",
+    position = pd_serotype,
+    width = 0.18,
+    linewidth = 0.75
+  ) +
+  geom_point(
+    position = pd_serotype,
+    shape = 21,
+    color = "black",
+    stroke = 0.5,
+    size = 4.5
+  ) +
+  scale_color_manual(
+    values = serotype_colors,
+    breaks = names(serotype_labels),
+    labels = serotype_labels,
+    guide = "none"
+  ) +
+  scale_fill_manual(
+    values = serotype_colors,
+    breaks = names(serotype_labels),
+    labels = serotype_labels,
+    name = "Serotype"
+  ) +
+  guides(
+    fill = guide_legend(
+      title = "Serotype",
+      override.aes = list(
+        shape = 21,
+        color = "black",
+        size = 4
+      )
+    )
+  ) +
+  protein_y +
+  labs(
+    x = "Protein",
+    y = protein_y_label
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.title.x = element_text(
+      size = 24,
+      face = "bold"
+    ),
+
+    axis.title.y = element_text(
+      size = 24,
+      face = "bold"
+    ),
+
+    axis.text.x = element_text(
+      size = 22,
+    ),
+
+    axis.text.y = element_text(
+      size = 22,
+    ),
+
+    legend.position = "bottom",
+
+    legend.title = element_text(
+      size = 20,
+      face = "bold"
+    ),
+
+    legend.text = element_text(
+      size = 18
+    )
+  )
+
+print(p_serotype_by_protein)
+```
+
+
+## Optional note on missing values
+
+```{r protein-missing}
+protein_missing <- protein_df %>%
+  filter(!is.finite(mean) | !is.finite(hpd_lower) | !is.finite(hpd_upper)) %>%
+  select(serotype, protein_raw, protein, mean, hpd_lower, hpd_upper, ESS)
+
+knitr::kable(protein_missing, digits = 6)
+```
+
+# Original code you provided
+
+The section below preserves your original serotype and genotype analysis code.
+
+```{r serotype-genotype-data}
+# =========================================================
+# 1) Serotype-level data
+# =========================================================
+serotype_df <- parse_rate_sheet(file_path, "Serotype", "serotype") %>%
+  mutate(
+    serotype = case_when(
+      str_detect(serotype, "1") ~ "DENV1",
+      str_detect(serotype, "2") ~ "DENV2",
+      str_detect(serotype, "3") ~ "DENV3",
+      str_detect(serotype, "4") ~ "DENV4",
+      TRUE ~ serotype
+    ),
+    serotype = factor(serotype, levels = c("DENV1", "DENV2", "DENV3", "DENV4"))
+  )
+
+# =========================================================
+# 2) Genotype-level data
+# =========================================================
+genotype_df <- bind_rows(
+  parse_rate_sheet(file_path, "DENV1_Genotypes", "genotype") %>% mutate(serotype = "DENV1"),
+  parse_rate_sheet(file_path, "DENV2_Genotypes", "genotype") %>% mutate(serotype = "DENV2"),
+  parse_rate_sheet(file_path, "DENV3_Genotypes", "genotype") %>% mutate(serotype = "DENV3"),
+  parse_rate_sheet(file_path, "DENV4_Genotypes", "genotype") %>% mutate(serotype = "DENV4")
+) %>%
+  mutate(
+    serotype = factor(serotype, levels = c("DENV1", "DENV2", "DENV3", "DENV4"))
+  )
+
+# Manual genotype order, left to right within each serotype facet
+desired_order <- c(
+  "1I", "1III", "1IV", "1V",
+  "2I", "2II", "2III", "2V",
+  "3I", "3II", "3III",
+  "4I", "4II"
+)
+extra_levels <- setdiff(unique(as.character(genotype_df$genotype)), desired_order)
+all_levels <- c(desired_order, sort(extra_levels))
+
+genotype_df <- genotype_df %>%
+  mutate(genotype = factor(as.character(genotype), levels = all_levels))
+
+# =========================================================
+# 3) Shared Y-axis limits for serotype and genotype rate plots
+# =========================================================
+y_min <- 3e-4
+y_max <- 3e-3
+
+shared_y <- scale_y_log10(
+  limits = c(y_min, y_max),
+  breaks = rate_log_breaks,
+  labels = rate_log_labels,
+  expand = expansion(mult = c(0.02, 0.08))
+)
+
+shared_y_label <- expression(
+  atop(
+    bold("Evolutionary rate"),
+    bold("(s/s/y, log scale)")
+  )
+)
+```
+
+# Lineage metadata: full dataset versus subsampled dataset
+
+This section compares the full 70% coverage genome metadata with the subsampled metadata used for downstream BEAST analyses. The plots are organized into three chunks:
+
+1. Date-range and sample-size summaries by serotype and dataset.
+2. Country contribution summaries and country-by-sample-size plots.
+3. Continent-balance plots focused on Asia versus the Americas, shown as a distinct diverging percentage plot rather than another DENV-1 to DENV-4 stacked count plot.
+
+## Convert sampled TSV files to CSV
+
+Run this once if the sampled CSV files have not already been created.
+
+```{r convert-sampled-tsv-to-csv, eval=FALSE}
+sampled_tsv_files <- c(
+  DENV1 = "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV1_sampled.tsv",
+  DENV2 = "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV2_sampled.tsv",
+  DENV3 = "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV3_sampled.tsv",
+  DENV4 = "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV4_sampled.tsv"
+)
+
+for (serotype_name in names(sampled_tsv_files)) {
+  sampled_df_tmp <- read.delim(
+    sampled_tsv_files[[serotype_name]],
+    fill = TRUE,
+    quote = "",
+    comment.char = ""
+  )
+
+  write.csv(
+    sampled_df_tmp,
+    file.path(
+      "~/Desktop/DENV_EVO_2025/Lineage_metadata",
+      paste0(serotype_name, "_sampled.csv")
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+## Metadata helpers and import
+
+```{r lineage-metadata-import, fig.width=13, fig.height=5}
+# =========================================================
+# Metadata file paths
+# =========================================================
+metadata_files <- tibble::tribble(
+  ~serotype, ~dataset, ~file_path,
+  "DENV1", "Full dataset",       "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV1_together.csv",
+  "DENV2", "Full dataset",       "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV2_together.csv",
+  "DENV3", "Full dataset",       "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV3_together.csv",
+  "DENV4", "Full dataset",       "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV4_together.csv",
+  "DENV1", "Subsampled dataset", "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV1_sampled.csv",
+  "DENV2", "Subsampled dataset", "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV2_sampled.csv",
+  "DENV3", "Subsampled dataset", "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV3_sampled.csv",
+  "DENV4", "Subsampled dataset", "~/Desktop/DENV_EVO_2025/Lineage_metadata/DENV4_sampled.csv"
+)
+
+serotype_levels <- c("DENV1", "DENV2", "DENV3", "DENV4")
+dataset_levels <- c("Full dataset", "Subsampled dataset")
+
+# ---------------------------------------------------------
+# Colors
+# ---------------------------------------------------------
+continent_colors <- c(
+  "Asia"     = "#C2B709",
+  "Americas" = "#2A332D",
+  "Other"    = "grey70"
+)
+
+country_other_color <- "grey78"
+
+# ---------------------------------------------------------
+# Helpers for standardizing columns and dates
+# ---------------------------------------------------------
+find_first_existing_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) NA_character_ else hit[[1]]
+}
+
+standardize_continent <- function(x) {
+  x <- as.character(x)
+  case_when(
+    str_detect(str_to_lower(x), "asia") ~ "Asia",
+    str_detect(str_to_lower(x), "america|caribbean|latin") ~ "Americas",
+    TRUE ~ "Other"
+  )
+}
+
+standardize_region_from_country <- function(country, continent = NA_character_) {
+  # Prefer a continent/region column when it exists, then fall back to country names.
+  continent_std <- standardize_continent(continent)
+  country_clean <- str_to_lower(str_squish(as.character(country)))
+
+  asia_countries <- c(
+    "bangladesh", "bhutan", "brunei", "cambodia", "china", "hong kong", "india",
+    "indonesia", "japan", "laos", "malaysia", "maldives", "myanmar", "nepal",
+    "pakistan", "philippines", "singapore", "south korea", "sri lanka", "taiwan",
+    "thailand", "timor-leste", "vietnam"
+  )
+
+  americas_countries <- c(
+    "anguilla", "antigua and barbuda", "argentina", "aruba", "bahamas", "barbados",
+    "belize", "bolivia", "brazil", "canada", "cayman islands", "chile", "colombia",
+    "costa rica", "cuba", "curacao", "dominica", "dominican republic", "ecuador",
+    "el salvador", "french guiana", "grenada", "guadeloupe", "guatemala", "guyana",
+    "haiti", "honduras", "jamaica", "martinique", "mexico", "nicaragua", "panama",
+    "paraguay", "peru", "puerto rico", "saint barthelemy", "saint kitts and nevis",
+    "saint lucia", "saint martin", "saint vincent and the grenadines", "suriname",
+    "trinidad and tobago", "united states", "usa", "uruguay", "venezuela", "virgin islands"
+  )
+
+  case_when(
+    continent_std %in% c("Asia", "Americas") ~ continent_std,
+    country_clean %in% asia_countries ~ "Asia",
+    country_clean %in% americas_countries ~ "Americas",
+    str_detect(country_clean, "usa|united states|puerto rico|virgin islands") ~ "Americas",
+    TRUE ~ "Other"
+  )
+}
+
+extract_decimal_year <- function(x) {
+  # Robust parser for years, decimal years, ISO dates, slash dates, and messy dates.
+  # Falls back to the first 4-digit year if a full date cannot be parsed.
+  if (inherits(x, "Date")) {
+    yr <- as.numeric(format(x, "%Y"))
+    doy <- as.numeric(format(x, "%j"))
+    return(yr + (doy - 1) / 365.25)
+  }
+
+  x_chr <- str_trim(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "N/A", "na", "unknown", "Unknown", "?")] <- NA_character_
+
+  x_num <- suppressWarnings(as.numeric(x_chr))
+  out <- rep(NA_real_, length(x_chr))
+
+  decimal_or_plain_year <- !is.na(x_num) & x_num >= 1900 & x_num <= 2100
+  out[decimal_or_plain_year] <- x_num[decimal_or_plain_year]
+
+  excel_serial <- !is.na(x_num) & x_num > 20000 & x_num < 80000
+  if (any(excel_serial)) {
+    d <- as.Date(x_num[excel_serial], origin = "1899-12-30")
+    yr <- as.numeric(format(d, "%Y"))
+    doy <- as.numeric(format(d, "%j"))
+    out[excel_serial] <- yr + (doy - 1) / 365.25
+  }
+
+  still_missing <- is.na(out) & !is.na(x_chr)
+  date_formats <- c(
+    "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+    "%m/%d/%Y", "%m-%d-%Y", "%m.%d.%Y",
+    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+    "%Y-%m", "%Y/%m", "%Y.%m"
+  )
+
+  for (fmt in date_formats) {
+    idx <- which(still_missing)
+    if (length(idx) == 0) break
+    d <- suppressWarnings(as.Date(x_chr[idx], format = fmt))
+    good <- !is.na(d)
+    if (any(good)) {
+      yr <- as.numeric(format(d[good], "%Y"))
+      doy <- as.numeric(format(d[good], "%j"))
+      out[idx[good]] <- yr + (doy - 1) / 365.25
+    }
+    still_missing <- is.na(out) & !is.na(x_chr)
+  }
+
+  still_missing <- is.na(out) & !is.na(x_chr)
+  fallback_year <- suppressWarnings(as.numeric(str_extract(x_chr[still_missing], "(19|20)\\d{2}")))
+  out[still_missing] <- fallback_year
+
+  out
+}
+
+read_metadata_file <- function(file_path, serotype_label, dataset_label) {
+  df <- read_csv(file_path, show_col_types = FALSE)
+
+  country_col <- find_first_existing_col(df, c("country", "Country", "COUNTRY", "location_country", "Location_Country"))
+  continent_col <- find_first_existing_col(df, c("Continent", "continent", "CONTINENT", "region", "Region"))
+  lineage_col <- find_first_existing_col(df, c("major_lineage", "Major_Lineage", "Major lineage", "lineage", "Lineage"))
+  genotype_col <- find_first_existing_col(df, c("genotype", "Genotype", "GENOTYPE"))
+  date_col <- find_first_existing_col(df, c(
+    "date", "Date", "collection_date", "Collection_Date", "Collection date",
+    "sampling_date", "Sampling_Date", "sample_date", "Sample_Date", "year", "Year"
+  ))
+
+  if (is.na(country_col)) {
+    df <- df %>% mutate(country = "Unknown")
+  } else {
+    df <- df %>% mutate(country = as.character(.data[[country_col]]))
+  }
+
+  if (is.na(continent_col)) {
+    df <- df %>% mutate(Continent = "Other")
+  } else {
+    df <- df %>% mutate(Continent = .data[[continent_col]])
+  }
+
+  if (is.na(lineage_col)) {
+    df <- df %>% mutate(major_lineage = NA_character_)
+  } else {
+    df <- df %>% mutate(major_lineage = as.character(.data[[lineage_col]]))
+  }
+
+  if (is.na(genotype_col)) {
+    df <- df %>% mutate(genotype = NA_character_)
+  } else {
+    df <- df %>% mutate(genotype = as.character(.data[[genotype_col]]))
+  }
+
+  if (is.na(date_col)) {
+    stop(paste0("No date/year column found in ", file_path))
+  }
+
+  df %>%
+    mutate(
+      serotype = serotype_label,
+      dataset = dataset_label,
+      country = if_else(is.na(country) | country == "", "Unknown", country),
+      Continent = factor(standardize_region_from_country(country, Continent), levels = c("Asia", "Americas", "Other")),
+      sample_year = extract_decimal_year(.data[[date_col]]),
+      year = floor(sample_year)
+    ) %>%
+    select(dataset, serotype, genotype, major_lineage, country, Continent, sample_year, year, everything())
+}
+
+metadata_df <- purrr::pmap_dfr(
+  metadata_files,
+  function(serotype, dataset, file_path) {
+    read_metadata_file(file_path, serotype, dataset)
+  }
+) %>%
+  mutate(
+    dataset = factor(dataset, levels = dataset_levels),
+    serotype = factor(serotype, levels = serotype_levels)
+  )
+
+# Keep these names for downstream chunks that use the subsampled metadata.
+sampled_df <- metadata_df %>% filter(dataset == "Subsampled dataset")
+sampled_df_raw <- sampled_df
+```
+
+## Serotype and genotype evolutionary rates with flipped sample-size panels
+
+This figure places the BEAST evolutionary-rate estimates in the top row and the genome sample counts directly below the matching serotype and genotype panels. The sample-size y-axis is reversed so that bars extend downward from zero.
+
+```{r serotype-genotype-rates-with-sample-size, fig.width=15, fig.height=6.5}
+# =========================================================
+# 1) Sample-size data from genomes INCLUDED in rate analyses
+# =========================================================
+
+serotype_n_df <- serotype_df %>%
+  mutate(
+    serotype = as.character(serotype)
+  ) %>%
+  left_join(
+    sampled_df %>%
+      filter(!is.na(serotype)) %>%
+      count(serotype, name = "n"),
+    by = "serotype"
+  ) %>%
+  mutate(
+    serotype = factor(
+      serotype,
+      levels = c("DENV1", "DENV2", "DENV3", "DENV4")
+    )
+  )
+
+genotype_n_df <- genotype_df %>%
+  mutate(
+    genotype = as.character(genotype)
+  ) %>%
+  left_join(
+    sampled_df %>%
+      filter(
+        !is.na(serotype),
+        !is.na(genotype),
+        genotype != ""
+      ) %>%
+      count(serotype, genotype, name = "n"),
+    by = c("serotype", "genotype")
+  ) %>%
+  mutate(
+    serotype = factor(
+      serotype,
+      levels = c("DENV1", "DENV2", "DENV3", "DENV4")
+    ),
+    genotype = factor(
+      genotype,
+      levels = all_levels
+    )
+  )
+
+# =========================================================
+# 2) Shared flipped y-axis for sample-size panels
+# =========================================================
+
+sample_y_max <- ceiling(
+  max(
+    c(serotype_n_df$n, genotype_n_df$n),
+    na.rm = TRUE
+  ) / 100
+) * 100
+
+sample_y_flipped <- scale_y_continuous(
+  limits = c(-sample_y_max, 0),
+  breaks = -seq(0, sample_y_max, by = 250),
+  labels = function(x) ifelse(abs(x) %% 500 == 0, abs(x), ""),
+  expand = expansion(mult = c(0.02, 0.02))
+)
+
+# =========================================================
+# 3) SEROTYPE RATE PANEL
+# =========================================================
+
+p_serotype_rate <- ggplot(
+  serotype_df,
+  aes(
+    x = serotype,
+    y = mean,
+    color = serotype
+  )
+) +
+  scale_x_discrete(
+  labels = c(
+    "DENV1" = "DENV-1",
+    "DENV2" = "DENV-2",
+    "DENV3" = "DENV-3",
+    "DENV4" = "DENV-4"
+  )
+) +
+  geom_errorbar(
+    aes(
+      ymin = hpd_lower,
+      ymax = hpd_upper
+    ),
+    color = "black",
+    width = 0.18,
+    linewidth = 0.8
+  ) +
+  geom_point(
+    aes(fill = serotype),
+    shape = 21,
+    color = "black",
+    stroke = 0.5,
+    size = 3
+  ) +
+  scale_color_manual(
+    values = serotype_colors,
+    guide = "none"
+  ) +
+  scale_fill_manual(
+  values = serotype_colors,
+  guide = "none"
+) +
+scale_x_discrete(
+  labels = c(
+    "DENV1" = "DENV-1",
+    "DENV2" = "DENV-2",
+    "DENV3" = "DENV-3",
+    "DENV4" = "DENV-4"
+  )
+) +
+shared_y +
+  labs(
+    x = "Serotype",
+    y = shared_y_label
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+
+    axis.title.x = element_text(size = 18, face = "bold"),
+    axis.title.y = element_text(size = 18, face = "bold"),
+
+    axis.text.x = element_text(size = 16),
+    axis.text.y = element_text(size = 18),
+
+    axis.ticks.x = element_line(linewidth = 0.4),
+    axis.ticks.y = element_line(linewidth = 0.4),
+
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14, face = "bold")
+  )
+
+# =========================================================
+# 4) GENOTYPE RATE PANEL
+# =========================================================
+
+genotype_serotype_label_df <- genotype_df %>%
+  mutate(
+    serotype = factor(
+      serotype,
+      levels = c("DENV1", "DENV2", "DENV3", "DENV4")
+    ),
+    genotype = factor(
+      genotype,
+      levels = all_levels
+    )
+  ) %>%
+  filter(!is.na(genotype)) %>%
+  group_by(serotype) %>%
+  summarise(
+    genotype = genotype[ceiling(n_distinct(genotype) / 2)],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    serotype_label = recode(
+      as.character(serotype),
+      "DENV1" = "DENV-1",
+      "DENV2" = "DENV-2",
+      "DENV3" = "DENV-3",
+      "DENV4" = "DENV-4"
+    )
+  )
+
+p_genotype_rate <- ggplot(
+  genotype_df,
+  aes(
+    x = genotype,
+    y = mean,
+    color = serotype
+  )
+) +
+  geom_errorbar(
+    aes(
+      ymin = hpd_lower,
+      ymax = hpd_upper
+    ),
+    color = "black",
+    width = 0.18,
+    linewidth = 0.7
+  ) +
+  geom_point(
+    aes(fill = serotype),
+    shape = 21,
+    color = "black",
+    stroke = 0.5,
+    size = 2.6
+  ) +
+  geom_label(
+    data = genotype_serotype_label_df,
+    aes(
+      x = genotype,
+      y = Inf,
+      label = serotype_label
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.5,
+    fontface = "bold",
+    size = 7,
+    label.size = 0.35,
+    label.padding = unit(0.16, "lines"),
+    fill = "white"
+  ) +
+  scale_color_manual(
+    values = serotype_colors,
+    guide = "none"
+  ) +
+  scale_fill_manual(
+    values = serotype_colors,
+    guide = "none"
+  ) +
+  facet_grid(
+    cols = vars(serotype),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  shared_y +
+  coord_cartesian(clip = "off") +
+  labs(
+    x = "Genotype",
+    y = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title = element_text(
+      size = 18,
+      face = "bold",
+      hjust = 0.5
+    ),
+
+    strip.text.x = element_blank(),
+
+    strip.background = element_blank(),
+
+    axis.title.x = element_text(
+      size = 18,
+      face = "bold"
+    ),
+
+    axis.title.y = element_text(
+      size = 18,
+      face = "bold"
+    ),
+
+    axis.text.x = element_text(
+      size = 18
+    ),
+
+    axis.text.y = element_blank(),
+
+    axis.ticks.x = element_line(
+      linewidth = 0.4
+    ),
+
+    axis.ticks.y = element_blank(),
+
+    panel.spacing.x = unit(0.15, "lines"),
+
+    plot.margin = margin(34, 5, 0, 0)
+  )
+
+# =========================================================
+# 5) SEROTYPE SAMPLE-SIZE PANEL
+# =========================================================
+
+p_serotype_samples <- ggplot(
+  serotype_n_df,
+  aes(
+    x = serotype,
+    y = -n
+  )
+) +
+  geom_col(
+    width = 0.68,
+    fill = "grey70",
+    color = "black"
+  ) +
+  scale_x_discrete(position = "top") +
+  sample_y_flipped +
+  labs(
+    x = NULL,
+    y = "N"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+  axis.text.x = element_blank(),
+
+  axis.ticks.x = element_blank(),
+
+  axis.line.x.top = element_line(
+    color = "black",
+    linewidth = 0.4
+  ),
+
+  axis.ticks.x.top = element_line(
+    color = "black",
+    linewidth = 0.4
+  ),
+
+  axis.title.x = element_text(
+    size = 18,
+    face = "bold"
+  ),
+
+  axis.title.y = element_text(
+    size = 18,
+    face = "bold"
+  ),
+
+  axis.text.y = element_text(
+    size = 18
+  ),
+
+  axis.ticks.y = element_line(
+    linewidth = 0.4
+  ),
+
+  plot.title = element_text(
+    size = 16,
+    face = "bold",
+    hjust = 0.5
+  ),
+
+  plot.margin = margin(0, 10, 5, 5)
+)
+
+# =========================================================
+# 6) GENOTYPE SAMPLE-SIZE PANEL
+# =========================================================
+
+p_genotype_samples <- ggplot(
+  genotype_n_df,
+  aes(
+    x = genotype,
+    y = -n
+  )
+) +
+  geom_col(
+    width = 0.68,
+    fill = "grey70",
+    color = "black"
+  ) +
+  facet_grid(
+    cols = vars(serotype),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  scale_x_discrete(position = "top") +
+  sample_y_flipped +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+  strip.text.x = element_blank(),
+
+  strip.background = element_blank(),
+
+  axis.title.x = element_text(
+    size = 16,
+    face = "bold"
+  ),
+
+  axis.title.y = element_text(
+    size = 16,
+    face = "bold"
+  ),
+
+  axis.text.x = element_blank(),
+
+  axis.text.y = element_blank(),
+
+  axis.ticks.x = element_blank(),
+
+  axis.ticks.y = element_blank(),
+
+  axis.line.x.top = element_line(
+    color = "black",
+    linewidth = 0.4
+  ),
+
+  axis.ticks.x.top = element_line(
+    color = "black",
+    linewidth = 0.4
+  ),
+
+  plot.title = element_text(
+    size = 16,
+    face = "bold",
+    hjust = 0.5
+  ),
+
+  panel.spacing.x = unit(0.15, "lines"),
+
+  plot.margin = margin(0, 5, 5, 0)
+)
+
+# =========================================================
+# 7) BUILD ROWS FIRST
+# =========================================================
+
+p_rate_row <-
+  p_serotype_rate +
+  p_genotype_rate +
+  plot_layout(widths = c(1.5, 3.5))
+
+p_sample_row <-
+  p_serotype_samples +
+  p_genotype_samples +
+  plot_layout(widths = c(1.5, 3.5))
+
+# =========================================================
+# 8) FINAL COMBINED FIGURE
+# =========================================================
+
+p_serotype_genotype_with_samples <-
+  p_rate_row /
+  p_sample_row +
+  plot_layout(
+    heights = c(2.4, 1)
+  )
+
+print(p_serotype_genotype_with_samples)
+```
+
+
+## Date range and sample size summaries
+
+```{r metadata-date-range-summary}
+date_range_summary <- metadata_df %>%
+  group_by(dataset, serotype) %>%
+  summarise(
+    n_sequences = n(),
+    first_year = floor(min(sample_year, na.rm = TRUE)),
+    last_year = floor(max(sample_year, na.rm = TRUE)),
+    date_range = paste0(first_year, "-", last_year),
+    n_countries = n_distinct(country),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, serotype)
+
+knitr::kable(date_range_summary)
+```
+
+```{r metadata-sample-size-overview, fig.width=10, fig.height=4.5}
+metadata_sample_size_summary <- metadata_df %>%
+  count(dataset, serotype, name = "n_sequences")
+
+p_metadata_sample_size <- ggplot(
+  metadata_sample_size_summary,
+  aes(x = serotype, y = n_sequences, fill = dataset)
+) +
+  geom_col(position = position_dodge(width = 0.75), color = "black", width = 0.68) +
+  geom_text(
+    aes(label = comma(n_sequences)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.25,
+    size = 3.2
+  ) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Full versus subsampled metadata size by serotype",
+    x = "Serotype",
+    y = "Number of sequences",
+    fill = "Dataset"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+p_metadata_sample_size
+```
+
+## Country contribution summaries and country-by-sample-size plots
+
+```{r country-contribution-summaries}
+country_counts <- metadata_df %>%
+  filter(!is.na(country), country != "", country != "Unknown") %>%
+  count(dataset, serotype, country, name = "n") %>%
+  group_by(dataset, serotype) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+country_extremes_by_serotype <- country_counts %>%
+  group_by(dataset, serotype) %>%
+  summarise(
+    most_contributing_country = country[which.max(n)],
+    most_contributing_n = max(n),
+    most_contributing_percent = percent[which.max(n)],
+    least_contributing_country = country[which.min(n)],
+    least_contributing_n = min(n),
+    least_contributing_percent = percent[which.min(n)],
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, serotype)
+
+country_extremes_overall <- metadata_df %>%
+  filter(!is.na(country), country != "", country != "Unknown") %>%
+  count(dataset, country, name = "n") %>%
+  group_by(dataset) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  summarise(
+    most_contributing_country = country[which.max(n)],
+    most_contributing_n = max(n),
+    most_contributing_percent = percent[which.max(n)],
+    least_contributing_country = country[which.min(n)],
+    least_contributing_n = min(n),
+    least_contributing_percent = percent[which.min(n)],
+    .groups = "drop"
+  ) %>%
+  arrange(dataset)
+
+knitr::kable(country_extremes_overall, digits = 2)
+knitr::kable(country_extremes_by_serotype, digits = 2)
+```
+
+```{r country-sample-size-plots, fig.width=13, fig.height=9}
+# Collapse small countries within each dataset and serotype so the country plots remain readable.
+country_min_n <- 5
+country_plot_df <- country_counts %>%
+  mutate(
+    country_plot = if_else(n >= country_min_n, country, "Other countries")
+  ) %>%
+  group_by(dataset, serotype, country_plot) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  group_by(dataset, serotype) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup()
+
+country_levels <- country_plot_df %>%
+  group_by(country_plot) %>%
+  summarise(total_n = sum(n), .groups = "drop") %>%
+  arrange(desc(total_n)) %>%
+  pull(country_plot)
+
+country_levels <- c(setdiff(country_levels, "Other countries"), "Other countries")
+
+country_colors <- c(
+  setNames(
+    colorspace::qualitative_hcl(length(setdiff(country_levels, "Other countries")), palette = "Dynamic"),
+    setdiff(country_levels, "Other countries")
+  ),
+  "Other countries" = country_other_color
+)
+
+if (nrow(country_plot_df) == 0) {
+  message(
+    "No country rows were available for the country sample-size plot. Check country values with: count(metadata_df, dataset, serotype, country, sort = TRUE)"
+  )
+} else {
+  p_country_sample_size <- ggplot(
+    country_plot_df %>% mutate(country_plot = factor(country_plot, levels = country_levels)),
+    aes(x = serotype, y = n, fill = country_plot)
+  ) +
+    geom_col(color = "black", linewidth = 0.25) +
+    facet_wrap(~ dataset, ncol = 1, scales = "free_y", drop = FALSE) +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.06))) +
+    scale_fill_manual(values = country_colors, drop = FALSE) +
+    labs(
+      title = paste0("Country contribution by sample size, countries with n < ", country_min_n, " collapsed"),
+      x = "Serotype",
+      y = "Number of sequences",
+      fill = "Country"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      strip.text = element_text(face = "bold"),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.35, "cm")
+    ) +
+    guides(fill = guide_legend(ncol = 6, byrow = TRUE))
+
+  p_country_sample_size
+}
+```
+
+## Asia, Americas, and other regions as a share of total sequences
+
+This plot uses additive 100% stacked bars. Each bar is calculated from the full serotype-specific dataset total, so Asia and the Americas are interpreted relative to all sequences, with `Other` retained in the denominator and shown directly in the bar.
+
+```{r asia-americas-balance-plot, fig.width=11, fig.height=5.5}
+continent_balance_df <- metadata_df %>%
+  mutate(
+    dataset = factor(as.character(dataset), levels = dataset_levels),
+    serotype = factor(as.character(serotype), levels = serotype_levels),
+    Continent = factor(as.character(Continent), levels = c("Asia", "Americas", "Other"))
+  ) %>%
+  count(dataset, serotype, Continent, name = "n", .drop = FALSE) %>%
+  tidyr::complete(
+    dataset = factor(dataset_levels, levels = dataset_levels),
+    serotype = factor(serotype_levels, levels = serotype_levels),
+    Continent = factor(c("Asia", "Americas", "Other"), levels = c("Asia", "Americas", "Other")),
+    fill = list(n = 0)
+  ) %>%
+  group_by(dataset, serotype) %>%
+  mutate(
+    dataset_serotype_total = sum(n, na.rm = TRUE),
+    percent = if_else(dataset_serotype_total > 0, 100 * n / dataset_serotype_total, 0)
+  ) %>%
+  ungroup() %>%
+  filter(dataset_serotype_total > 0) %>%
+  mutate(
+    Continent = factor(Continent, levels = c("Other", "Americas", "Asia")),
+    percent_label = if_else(percent >= 4, paste0(round(percent, 1), "%"), "")
+  )
+
+if (nrow(continent_balance_df) == 0) {
+  message(
+    "No rows were available for the region contribution plot. Check metadata_df with: count(metadata_df, dataset, serotype, Continent, sort = TRUE)"
+  )
+} else {
+  p_asia_americas_balance <- ggplot(
+    continent_balance_df,
+    aes(x = serotype, y = percent, fill = Continent)
+  ) +
+    geom_col(width = 0.72, color = "black", linewidth = 0.25) +
+    geom_text(
+      aes(label = percent_label),
+      position = position_stack(vjust = 0.5),
+      size = 3.2,
+      color = "black"
+    ) +
+    facet_wrap(~ dataset, nrow = 1, drop = FALSE) +
+    scale_fill_manual(values = continent_colors[c("Other", "Americas", "Asia")], drop = FALSE) +
+    scale_y_continuous(
+      limits = c(0, 100),
+      breaks = seq(0, 100, by = 25),
+      labels = function(x) paste0(x, "%"),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(
+      title = "Regional contribution in full and subsampled datasets",
+      subtitle = "Each bar sums to 100% of all sequences for that serotype and dataset",
+      x = "Serotype",
+      y = "Share of total sequences",
+      fill = "Region"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      strip.text = element_text(face = "bold"),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold")
+    )
+
+  p_asia_americas_balance
+}
+```
+
+## Subsampled dataset lineage plots by serotype
+
+The lineage plots are still arranged vertically because the legends are smaller. Country-by-year plots are printed one serotype at a time below so the x-axis and legends remain readable.
+
+```{r subsampled-lineage-and-country-plots, fig.width=13, fig.height=8}
+plot_year_by_lineage <- function(df, serotype_label) {
+  year_summary <- df %>%
+    filter(serotype == serotype_label, !is.na(year), !is.na(major_lineage), major_lineage != "") %>%
+    count(year, major_lineage, name = "n")
+
+  lineage_cols <- setNames(
+    colorspace::qualitative_hcl(length(unique(year_summary$major_lineage)), palette = "Dark3"),
+    sort(unique(year_summary$major_lineage))
+  )
+
+  ggplot(year_summary, aes(x = year, y = n, fill = major_lineage)) +
+    geom_col() +
+    scale_fill_manual(values = lineage_cols) +
+    scale_x_continuous(breaks = sort(unique(year_summary$year))) +
+    labs(
+      title = paste0(str_replace(serotype_label, "DENV", "DENV-"), " subsampled sequences by calendar year"),
+      x = "Calendar year",
+      y = "Count",
+      fill = "Major lineage"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom",
+      legend.text = element_text(size = 9),
+      legend.key.size = unit(0.35, "cm")
+    ) +
+    guides(fill = guide_legend(ncol = 9, byrow = TRUE))
+}
+
+plot_year_by_country <- function(df, serotype_label, dataset_label, top_n_countries = 12) {
+  serotype_df <- df %>%
+    filter(serotype == serotype_label, !is.na(year), !is.na(country), country != "", country != "Unknown")
+
+  top_countries <- serotype_df %>%
+    count(country, sort = TRUE) %>%
+    slice_head(n = top_n_countries) %>%
+    pull(country)
+
+  year_summary <- serotype_df %>%
+    mutate(country_plot = if_else(country %in% top_countries, country, "Other countries")) %>%
+    count(year, country_plot, name = "n")
+
+  country_levels_local <- year_summary %>%
+    group_by(country_plot) %>%
+    summarise(total_n = sum(n), .groups = "drop") %>%
+    arrange(desc(total_n)) %>%
+    pull(country_plot)
+  country_levels_local <- c(setdiff(country_levels_local, "Other countries"), "Other countries")
+
+  cols <- c(
+    setNames(
+      colorspace::qualitative_hcl(length(setdiff(country_levels_local, "Other countries")), palette = "Dynamic"),
+      setdiff(country_levels_local, "Other countries")
+    ),
+    "Other countries" = country_other_color
+  )
+
+  ggplot(year_summary %>% mutate(country_plot = factor(country_plot, levels = country_levels_local)),
+         aes(x = year, y = n, fill = country_plot)) +
+    geom_col(width = 0.95) +
+    scale_fill_manual(values = cols, drop = FALSE) +
+    scale_x_continuous(
+      breaks = scales::pretty_breaks(n = 12),
+      expand = expansion(mult = c(0.005, 0.01))
+    ) +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.06))) +
+    labs(
+      title = paste0(str_replace(serotype_label, "DENV", "DENV-"), " ", str_to_lower(dataset_label), " sequences by country and calendar year"),
+      subtitle = paste0("Top ", top_n_countries, " countries are shown individually; remaining countries are collapsed"),
+      x = "Calendar year",
+      y = "Count",
+      fill = "Country"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom",
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.32, "cm")
+    ) +
+    guides(fill = guide_legend(ncol = 5, byrow = TRUE))
+}
+
+subsampled_lineage_plots <- purrr::map(serotype_levels, ~ plot_year_by_lineage(sampled_df, .x))
+print(wrap_plots(subsampled_lineage_plots, ncol = 1))
+```
+
+## Subsampled dataset country-by-year plots by serotype
+
+```{r subsampled-country-year-plots-readable, fig.width=13, fig.height=5.6, results='asis'}
+for (serotype_i in serotype_levels) {
+  print(plot_year_by_country(sampled_df, serotype_i, "Subsampled dataset", top_n_countries = 12))
+}
+```
+
+## Full dataset lineage plots by serotype
+
+```{r full-lineage-plots, fig.width=13, fig.height=8}
+full_df <- metadata_df %>% filter(dataset == "Full dataset")
+
+full_lineage_plots <- purrr::map(serotype_levels, ~ plot_year_by_lineage(full_df, .x))
+print(wrap_plots(full_lineage_plots, ncol = 1))
+```
+
+## Full dataset country-by-year plots by serotype
+
+```{r full-country-year-plots-readable, fig.width=13, fig.height=5.6, results='asis'}
+for (serotype_i in serotype_levels) {
+  print(plot_year_by_country(full_df, serotype_i, "Full dataset", top_n_countries = 12))
+}
+```
+
+```{r filtered-subsampled-objects-for-major-lineage-rate-plot}
+# ---------------------------------------------------------
+# Keep only target genotypes for downstream major-lineage plots
+# ---------------------------------------------------------
+desired_genotypes <- c(
+  "1I", "1III", "1IV", "1V",
+  "2I", "2II", "2III", "2V",
+  "3I", "3II", "3III",
+  "4I", "4II"
+)
+
+filtered_sampled_df <- sampled_df %>%
+  filter(genotype %in% desired_genotypes) %>%
+  mutate(
+    genotype = factor(genotype, levels = desired_genotypes),
+    serotype = factor(as.character(serotype), levels = serotype_levels)
+  )
+```
+
+```{r major-lineage-aligned-evolutionary-rates-sampling, fig.width=18, fig.height=7.5}
+# =========================================================
+# Major lineage evolutionary rates with aligned sample size,
+# continent distribution, and temporal sampling evidence.
+#
+# Alignment fix:
+# - Use one master lineage order.
+# - Convert lineage identity to one numeric x_index used by all panels.
+# - Do not facet with free_x for the aligned figure.
+# - Keep identical x limits in all panels.
+# =========================================================
+
+min_major_lineage_n <- 20
+collection_point_size <- 0.55
+collection_linewidth <- 0.45
+
+# Parse the rate estimates first, then use them as the master set of plotted lineages.
+major_lineage_df <- bind_rows(
+  parse_rate_sheet(file_path, "DENV1_Major_Lineages", "major_lineage") %>% mutate(serotype = "DENV1"),
+  parse_rate_sheet(file_path, "DENV2_Major_Lineages", "major_lineage") %>% mutate(serotype = "DENV2"),
+  parse_rate_sheet(file_path, "DENV3_Major_Lineages", "major_lineage") %>% mutate(serotype = "DENV3"),
+  parse_rate_sheet(file_path, "DENV4_Major_Lineages", "major_lineage") %>% mutate(serotype = "DENV4")
+) %>%
+  mutate(
+    serotype = factor(serotype, levels = c("DENV1", "DENV2", "DENV3", "DENV4")),
+    major_lineage = as.character(major_lineage)
+  ) %>%
+  filter(
+    str_detect(major_lineage, "_"),
+    is.finite(mean),
+    is.finite(hpd_lower),
+    is.finite(hpd_upper)
+  )
+
+valid_major_lineages <- major_lineage_df %>%
+  distinct(serotype, major_lineage)
+
+lineage_n_df <- filtered_sampled_df %>%
+  filter(!is.na(major_lineage), major_lineage != "", str_detect(major_lineage, "_")) %>%
+  mutate(
+    serotype = factor(as.character(serotype), levels = c("DENV1", "DENV2", "DENV3", "DENV4")),
+    genotype = factor(as.character(genotype), levels = desired_genotypes),
+    Continent = factor(as.character(Continent), levels = c("Asia", "Americas", "Other"))
+  ) %>%
+  semi_join(valid_major_lineages, by = c("serotype", "major_lineage")) %>%
+  count(serotype, genotype, major_lineage, Continent, name = "n")
+
+lineage_totals <- lineage_n_df %>%
+  group_by(serotype, genotype, major_lineage) %>%
+  summarise(n_total = sum(n), .groups = "drop") %>%
+  filter(n_total >= min_major_lineage_n) %>%
+  mutate(
+    serotype = factor(as.character(serotype), levels = c("DENV1", "DENV2", "DENV3", "DENV4")),
+    genotype = factor(as.character(genotype), levels = desired_genotypes),
+    lineage_suffix = str_remove(major_lineage, paste0("^", as.character(genotype), "_?")),
+    lineage_suffix = if_else(lineage_suffix == major_lineage, "", lineage_suffix),
+    lineage_suffix_sort = if_else(lineage_suffix == "", "0", lineage_suffix)
+  ) %>%
+  arrange(serotype, genotype, lineage_suffix_sort, major_lineage)
+
+lineage_order <- lineage_totals$major_lineage
+lineage_index_df <- lineage_totals %>%
+  mutate(
+    x_index = row_number(),
+    lineage_label = paste0(major_lineage),
+    serotype_label = recode(as.character(serotype),
+      "DENV1" = "DENV-1",
+      "DENV2" = "DENV-2",
+      "DENV3" = "DENV-3",
+      "DENV4" = "DENV-4"
+    ),
+    genotype_label = as.character(genotype)
+  ) %>%
+  select(serotype, genotype, major_lineage, n_total, x_index, lineage_label, serotype_label, genotype_label)
+
+x_breaks <- lineage_index_df$x_index
+x_labels <- lineage_index_df$lineage_label
+x_limits <- c(0.4, max(x_breaks) + 0.6)
+
+genotype_label_df <- lineage_index_df %>%
+  group_by(serotype, genotype, serotype_label, genotype_label) %>%
+  summarise(
+    xmin = min(x_index) - 0.5,
+    xmax = max(x_index) + 0.5,
+    x_mid = mean(range(x_index)),
+    .groups = "drop"
+  )
+
+serotype_label_df <- lineage_index_df %>%
+  group_by(serotype, serotype_label) %>%
+  summarise(
+    xmin = min(x_index) - 0.5,
+    xmax = max(x_index) + 0.5,
+    x_mid = mean(range(x_index)),
+    .groups = "drop"
+  )
+
+serotype_boundary_df <- serotype_label_df %>%
+  filter(xmin > min(xmin, na.rm = TRUE))
+
+serotype_box_df <- serotype_label_df %>%
+  mutate(y = Inf)
+
+major_lineage_df <- major_lineage_df %>%
+  inner_join(lineage_index_df, by = c("serotype", "major_lineage"))
+
+major_lineage_y_min <- 3e-4
+major_lineage_y_max <- max(major_lineage_df$hpd_upper, na.rm = TRUE)
+
+major_lineage_y <- scale_y_log10(
+  limits = c(major_lineage_y_min, major_lineage_y_max),
+  breaks = rate_log_breaks,
+  labels = rate_log_labels,
+  expand = expansion(mult = c(0.02, 0.12))
+)
+
+major_lineage_y_label <- expression(
+  atop(
+    bold("Evolutionary rate"),
+    bold("(s/s/y, log scale)")
+  )
+)
+
+lineage_bar_df <- lineage_n_df %>%
+  inner_join(lineage_index_df, by = c("serotype", "genotype", "major_lineage")) %>%
+  select(x_index, Continent, n) %>%
+  complete(
+    x_index = x_breaks,
+    Continent = factor(c("Asia", "Americas", "Other"), levels = c("Asia", "Americas", "Other")),
+    fill = list(n = 0)
+  )
+
+lineage_bar_totals <- lineage_index_df %>%
+  transmute(x_index, n_total)
+
+sample_y_max <- ceiling(max(lineage_index_df$n_total, na.rm = TRUE) / 50) * 50
+
+lineage_presence_years <- filtered_sampled_df %>%
+  filter(!is.na(major_lineage), major_lineage != "", str_detect(major_lineage, "_"), is.finite(sample_year)) %>%
+  mutate(
+    year = floor(sample_year),
+    serotype = factor(as.character(serotype), levels = c("DENV1", "DENV2", "DENV3", "DENV4")),
+    genotype = factor(as.character(genotype), levels = desired_genotypes),
+    Continent = factor(as.character(Continent), levels = c("Asia", "Americas", "Other"))
+  ) %>%
+  distinct(serotype, genotype, major_lineage, Continent, year) %>%
+  inner_join(lineage_index_df, by = c("serotype", "genotype", "major_lineage")) %>%
+  arrange(x_index, Continent, year) %>%
+  group_by(x_index, Continent) %>%
+  mutate(run_id = cumsum(year - lag(year, default = first(year)) > 1)) %>%
+  ungroup()
+
+full_start_year <- floor(min(lineage_presence_years$year, na.rm = TRUE))
+full_end_year <- ceiling(max(lineage_presence_years$year, na.rm = TRUE))
+
+temporal_runs_table <- lineage_presence_years %>%
+  group_by(serotype, genotype, major_lineage, n_total) %>%
+  summarise(
+    first_year = min(year),
+    last_year = max(year),
+    years_sampled = n_distinct(year),
+    .groups = "drop"
+  ) %>%
+  arrange(serotype, genotype, major_lineage)
+
+knitr::kable(temporal_runs_table)
+
+shared_x <- scale_x_continuous(
+  limits = x_limits,
+  breaks = x_breaks,
+  labels = x_labels,
+  expand = expansion(mult = c(0, 0))
+)
+
+shared_plot_theme <- theme_classic(base_size = 20) +
+  theme(
+  plot.title = element_text(
+    size = 20,
+    face = "bold",
+    hjust = 0.5
+  ),
+
+  axis.title.x = element_blank(),
+
+  axis.title.y = element_text(
+    size = 18,
+    face = "bold"
+  ),
+
+  axis.text.x = element_blank(),
+
+  axis.text.y = element_text(
+    size = 18
+  ),
+
+  axis.ticks.x = element_blank(),
+
+  axis.ticks.y = element_line(
+    linewidth = 0.4
+  ),
+
+  legend.title = element_text(
+    size = 18,
+    face = "bold"
+  ),
+
+  legend.text = element_text(
+    size = 16
+  ),
+
+  legend.position = "none",
+
+  plot.margin = margin(8, 8, 8, 8)
+)
+
+p_major_lineage_rate_aligned <- ggplot(
+  major_lineage_df,
+  aes(x = x_index, y = mean)
+) +
+  geom_errorbar(
+    aes(ymin = hpd_lower, ymax = hpd_upper),
+    width = 0.14,
+    linewidth = 0.65,
+    color = "black"
+  ) +
+  geom_point(
+    aes(fill = serotype),
+    shape = 21,
+    color = "black",
+    stroke = 0.45,
+    size = 2.6
+  ) +
+  geom_vline(
+    data = genotype_label_df,
+    aes(xintercept = xmin),
+    inherit.aes = FALSE,
+    color = "grey82",
+    linewidth = 0.35
+  ) +
+  geom_vline(
+    data = serotype_boundary_df,
+    aes(xintercept = xmin),
+    inherit.aes = FALSE,
+    color = "grey35",
+    linewidth = 0.75
+  ) +
+  geom_label(
+    data = serotype_box_df,
+    aes(x = x_mid, y = y, label = serotype_label),
+    inherit.aes = FALSE,
+    vjust = -1.65,
+    fontface = "bold",
+    size = 7,
+    label.size = 0.35,
+    label.padding = unit(0.16, "lines"),
+    fill = "white"
+  ) +
+  geom_text(
+    data = genotype_label_df,
+    aes(x = x_mid, y = Inf, label = genotype_label),
+    inherit.aes = FALSE,
+    vjust = -0.35,
+    fontface = "bold",
+    size = 5
+  ) +
+  scale_fill_manual(values = serotype_colors, name = "Serotype") +
+  shared_x +
+  major_lineage_y +
+  coord_cartesian(clip = "off") +
+  labs(
+    y = major_lineage_y_label
+  ) +
+  shared_plot_theme +
+  theme(
+    plot.margin = margin(34, 8, 12, 8)
+  )
+
+p_major_lineage_samples_aligned <- ggplot(
+  lineage_bar_df,
+  aes(x = x_index, y = n, fill = Continent)
+) +
+  geom_col(color = "black", width = 0.72, linewidth = 0.55) +
+  geom_vline(
+    data = genotype_label_df,
+    aes(xintercept = xmin),
+    inherit.aes = FALSE,
+    color = "grey82",
+    linewidth = 0.35
+  ) +
+  geom_vline(
+    data = serotype_boundary_df,
+    aes(xintercept = xmin),
+    inherit.aes = FALSE,
+    color = "grey35",
+    linewidth = 0.75
+  ) +
+  scale_fill_manual(values = continent_colors, drop = FALSE) +
+  scale_y_continuous(
+  limits = c(0, sample_y_max),
+  breaks = seq(0, sample_y_max, by = 50),
+  labels = function(x) ifelse(x %% 100 == 0, x, ""),
+  expand = expansion(mult = c(0, 0.08))
+) +
+  shared_x +
+  labs(y = "N") +
+  shared_plot_theme
+
+p_major_lineage_temporal_aligned <- ggplot(
+  lineage_presence_years,
+  aes(x = x_index, y = year, color = Continent, group = interaction(x_index, Continent, run_id))
+) +
+  geom_line(linewidth = 0.55, alpha = 0.9) +
+  geom_point(size = 0.75, alpha = 0.95) +
+  geom_vline(
+    data = genotype_label_df,
+    aes(xintercept = xmin),
+    inherit.aes = FALSE,
+    color = "grey82",
+    linewidth = 0.35
+  ) +
+  geom_vline(
+    data = serotype_boundary_df,
+    aes(xintercept = xmin),
+    inherit.aes = FALSE,
+    color = "grey35",
+    linewidth = 0.75
+  ) +
+  scale_color_manual(values = continent_colors, drop = FALSE, guide = "none") +
+  scale_y_continuous(
+    limits = c(full_start_year, full_end_year),
+    breaks = seq(full_start_year, full_end_year, by = 10),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  shared_x +
+coord_cartesian(clip = "off") +
+labs(
+  x = "Major lineage",
+  y = "Yearly sampling",
+  color = "Continent"
+) +
+  theme_classic(base_size = 20) +
+  theme(
+  plot.title = element_text(
+    size = 20,
+    face = "bold",
+    hjust = 0.5
+  ),
+
+  axis.title.x = element_text(
+    size = 18,
+    face = "bold"
+  ),
+
+  axis.title.y = element_text(
+    size = 18,
+    face = "bold"
+  ),
+
+  axis.text.x = element_text(
+    size = 18,
+    angle = 90,
+    hjust = 0.45,
+    vjust = 0.3
+  ),
+
+  axis.text.y = element_text(
+    size = 18
+  ),
+
+  axis.ticks.x = element_line(
+    linewidth = 0.4
+  ),
+
+  axis.ticks.y = element_line(
+    linewidth = 0.4
+  ),
+
+  legend.title = element_text(
+    size = 16,
+    face = "bold"
+  ),
+
+  legend.text = element_text(
+    size = 16,
+    face = "bold"
+  ),
+
+  legend.position = "bottom",
+
+  plot.margin = margin(12, 8, 90, 8)
+)
+
+p_major_lineage_aligned <- p_major_lineage_rate_aligned /
+  p_major_lineage_samples_aligned /
+  p_major_lineage_temporal_aligned +
+  plot_layout(heights = c(2.35, 0.8, 1.9), guides = "collect") &
+  theme(legend.position = "bottom")
+
+c
+```
+
+# Summary figure: serotype, genotype, and major lineage rates in one log-scale plot
+
+
+```{r}
+fig1 <- patchwork::wrap_elements(full = patchwork::patchworkGrob(p_serotype_genotype_with_samples)) /
+  patchwork::wrap_elements(full = patchwork::patchworkGrob(p_major_lineage_aligned)) +
+  patchwork::plot_layout(heights = c(1, 1.6))
+
+ggsave(
+  filename = "Figure1.svg",
+  plot = fig1,
+  width = 25 * (2/3), height = 25 * (2/3), units = "in",
+  device = svglite::svglite
+)
+```
+```{r}
+ggsave(
+  filename = "Figure2.svg",
+  plot = p_serotype_by_protein,
+  width = 25 * (2/3),
+  height = 8 * (2/3),
+  units = "in",
+  device = svglite::svglite
+)
+```
+
+
+
+
