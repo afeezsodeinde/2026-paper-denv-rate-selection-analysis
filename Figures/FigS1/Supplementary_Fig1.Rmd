@@ -1,0 +1,499 @@
+---
+title: "DENV major-lineage sampling through time"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(tibble)
+library(colorspace)
+library(patchwork)
+library(purrr)
+library(forcats)
+library(grid)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+serotype_levels <- c("DENV1", "DENV2", "DENV3", "DENV4")
+serotype_labels <- c(
+  "DENV1" = "DENV-1",
+  "DENV2" = "DENV-2",
+  "DENV3" = "DENV-3",
+  "DENV4" = "DENV-4"
+)
+
+dataset_levels <- c("Full dataset", "Subsampled dataset")
+
+# Set to 1 to show every major lineage. Keep at 5 to collapse very rare lineages.
+lineage_min_n <- 5
+lineage_other_label <- paste0("Other lineages (<", lineage_min_n, ")")
+other_color <- "grey72"
+unknown_color <- "grey45"
+
+figure_output_dir <- "~/Desktop/DENV_EVO_2025/Subsampling_figures_major_lineage"
+dir.create(figure_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+base_sampling_theme <- theme_classic(base_size = 9) +
+  theme(
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    legend.key.size = unit(0.13, "cm"),
+    legend.spacing.x = unit(0.04, "cm"),
+    legend.spacing.y = unit(0.00, "cm"),
+    legend.margin = margin(-4, 0, -4, 0),
+    legend.box.margin = margin(-6, 0, -6, 0),
+    plot.margin = margin(4, 5, 4, 5)
+  )
+```
+
+# File paths
+
+Update `metadata_dir` if needed. The import function accepts `.csv`, `.tsv`, and `.txt` files.
+
+```{r file-paths}
+metadata_dir <- "~/Desktop/DENV_EVO_2025/Lineage_metadata"
+
+metadata_files <- tibble::tribble(
+  ~serotype, ~dataset, ~file_stem,
+  "DENV1", "Full dataset",       "DENV1_together",
+  "DENV2", "Full dataset",       "DENV2_together",
+  "DENV3", "Full dataset",       "DENV3_together",
+  "DENV4", "Full dataset",       "DENV4_together",
+  "DENV1", "Subsampled dataset", "DENV1_sampled",
+  "DENV2", "Subsampled dataset", "DENV2_sampled",
+  "DENV3", "Subsampled dataset", "DENV3_sampled",
+  "DENV4", "Subsampled dataset", "DENV4_sampled"
+) %>%
+  mutate(file_path = file.path(metadata_dir, file_stem))
+```
+
+# Helper functions
+
+```{r helpers}
+resolve_metadata_path <- function(file_stem_path) {
+  candidates <- c(
+    paste0(file_stem_path, ".csv"),
+    paste0(file_stem_path, ".tsv"),
+    paste0(file_stem_path, ".txt")
+  )
+  hit <- candidates[file.exists(path.expand(candidates))]
+  if (length(hit) == 0) {
+    stop("Could not find metadata file for: ", file_stem_path,
+         "\nChecked: ", paste(candidates, collapse = ", "))
+  }
+  hit[[1]]
+}
+
+read_delim_auto <- function(file_path) {
+  resolved <- resolve_metadata_path(file_path)
+  ext <- tools::file_ext(resolved)
+  if (tolower(ext) == "tsv" || tolower(ext) == "txt") {
+    read_tsv(resolved, show_col_types = FALSE)
+  } else {
+    read_csv(resolved, show_col_types = FALSE)
+  }
+}
+
+find_first_existing_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) NA_character_ else hit[[1]]
+}
+
+extract_decimal_year <- function(x) {
+  if (inherits(x, "Date")) {
+    yr <- as.numeric(format(x, "%Y"))
+    doy <- as.numeric(format(x, "%j"))
+    return(yr + (doy - 1) / 365.25)
+  }
+
+  x_chr <- str_trim(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "N/A", "na", "unknown", "Unknown", "?")] <- NA_character_
+  x_num <- suppressWarnings(as.numeric(x_chr))
+  out <- rep(NA_real_, length(x_chr))
+
+  decimal_or_plain_year <- !is.na(x_num) & x_num >= 1900 & x_num <= 2100
+  out[decimal_or_plain_year] <- x_num[decimal_or_plain_year]
+
+  excel_serial <- !is.na(x_num) & x_num > 20000 & x_num < 80000
+  if (any(excel_serial)) {
+    d <- as.Date(x_num[excel_serial], origin = "1899-12-30")
+    yr <- as.numeric(format(d, "%Y"))
+    doy <- as.numeric(format(d, "%j"))
+    out[excel_serial] <- yr + (doy - 1) / 365.25
+  }
+
+  still_missing <- is.na(out) & !is.na(x_chr)
+  date_formats <- c(
+    "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+    "%m/%d/%Y", "%m-%d-%Y", "%m.%d.%Y",
+    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+    "%Y-%m", "%Y/%m", "%Y.%m"
+  )
+
+  for (fmt in date_formats) {
+    idx <- which(still_missing)
+    if (length(idx) == 0) break
+    d <- suppressWarnings(as.Date(x_chr[idx], format = fmt))
+    good <- !is.na(d)
+    if (any(good)) {
+      yr <- as.numeric(format(d[good], "%Y"))
+      doy <- as.numeric(format(d[good], "%j"))
+      out[idx[good]] <- yr + (doy - 1) / 365.25
+    }
+    still_missing <- is.na(out) & !is.na(x_chr)
+  }
+
+  still_missing <- is.na(out) & !is.na(x_chr)
+  fallback_year <- suppressWarnings(as.numeric(str_extract(x_chr[still_missing], "(19|20)\\d{2}")))
+  out[still_missing] <- fallback_year
+  out
+}
+
+make_shared_breaks <- function(years, n = 10) {
+  years <- sort(unique(years[is.finite(years)]))
+  if (length(years) <= n) return(years)
+  pretty(range(years), n = n)
+}
+
+# Major lineage strings look like 1I_K, 1III_A, 2V_B, 4II_A.
+# This extracts the part before the underscore so that lineages from the
+# same genotype/major group get related shades.
+extract_lineage_group <- function(x) {
+  x <- as.character(x)
+  out <- str_extract(x, "^[^_]+")
+  out[is.na(out) | out == ""] <- x[is.na(out) | out == ""]
+  out
+}
+
+# Palette rule:
+# - each group before underscore gets one base hue
+# - individual lineages within the same group get related DARK shades
+# - no near-white shades, because pale colors make stacked bars look patchy
+# - Other and Unknown remain greys
+make_grouped_lineage_palette <- function(lineage_levels, other_name = lineage_other_label) {
+  lineage_levels <- as.character(lineage_levels)
+  lineage_levels <- lineage_levels[!is.na(lineage_levels)]
+
+  special_levels <- lineage_levels[lineage_levels %in% c(other_name, "Unknown lineage", "unassigned", "Unassigned")]
+  main_levels <- setdiff(lineage_levels, special_levels)
+
+  if (length(main_levels) == 0) {
+    cols <- character(0)
+  } else {
+    lineage_groups <- extract_lineage_group(main_levels)
+    group_levels <- unique(lineage_groups)
+
+    # Dark, saturated base colors. These are intentionally not pastel.
+    base_pool <- c(
+      "#B2182B", # red
+      "#2166AC", # blue
+      "#1B7837", # green
+      "#762A83", # purple
+      "#B35806", # brown/orange
+      "#008837", # teal green
+      "#C51B7D", # magenta
+      "#5E3C99", # indigo
+      "#01665E", # dark teal
+      "#8C510A"  # dark brown
+    )
+    base_cols <- rep(base_pool, length.out = length(group_levels))
+    names(base_cols) <- group_levels
+
+    cols <- unlist(lapply(group_levels, function(g) {
+      levs <- main_levels[lineage_groups == g]
+      levs <- levs[order(levs)]
+      n <- length(levs)
+      base_col <- base_cols[[g]]
+
+      if (n == 1) {
+        shade_cols <- base_col
+      } else {
+        # Dark to medium variants only. This avoids white/pastel bars.
+        shade_steps <- seq(0.38, -0.18, length.out = n)
+        shade_cols <- vapply(shade_steps, function(s) {
+          if (s >= 0) {
+            colorspace::darken(base_col, amount = s)
+          } else {
+            colorspace::lighten(base_col, amount = abs(s))
+          }
+        }, character(1))
+      }
+
+      setNames(shade_cols, levs)
+    }))
+  }
+
+  if (other_name %in% lineage_levels) {
+    cols <- c(cols, setNames("grey55", other_name))
+  }
+  if ("Unknown lineage" %in% lineage_levels) {
+    cols <- c(cols, setNames("grey30", "Unknown lineage"))
+  }
+  if ("unassigned" %in% lineage_levels) {
+    cols <- c(cols, setNames("grey30", "unassigned"))
+  }
+  if ("Unassigned" %in% lineage_levels) {
+    cols <- c(cols, setNames("grey30", "Unassigned"))
+  }
+
+  cols[lineage_levels]
+}
+
+read_metadata_file <- function(file_path, serotype_label, dataset_label) {
+  df <- read_delim_auto(file_path)
+
+  lineage_col <- find_first_existing_col(df, c("major_lineage", "Major_Lineage", "Major lineage", "lineage", "Lineage"))
+  genotype_col <- find_first_existing_col(df, c("genotype", "Genotype", "GENOTYPE"))
+  date_col <- find_first_existing_col(df, c(
+    "date", "Date", "collection_date", "Collection_Date", "Collection date",
+    "sampling_date", "Sampling_Date", "sample_date", "Sample_Date", "year", "Year"
+  ))
+  country_col <- find_first_existing_col(df, c(
+    "country", "Country", "location", "Location", "country_exposure", "Country_exposure"
+  ))
+  id_col <- find_first_existing_col(df, c(
+    "strain", "Strain", "name", "Name", "sequence_name", "Sequence_name", "accession", "Accession", "genbank_accession"
+  ))
+
+  if (is.na(lineage_col)) df <- df %>% mutate(major_lineage = NA_character_) else df <- df %>% mutate(major_lineage = as.character(.data[[lineage_col]]))
+  if (is.na(genotype_col)) df <- df %>% mutate(genotype = NA_character_) else df <- df %>% mutate(genotype = as.character(.data[[genotype_col]]))
+  if (is.na(country_col)) df <- df %>% mutate(country = NA_character_) else df <- df %>% mutate(country = as.character(.data[[country_col]]))
+  if (is.na(id_col)) df <- df %>% mutate(sequence_id = NA_character_) else df <- df %>% mutate(sequence_id = as.character(.data[[id_col]]))
+  if (is.na(date_col)) stop(paste0("No date/year column found in ", file_path))
+
+  df %>%
+    mutate(
+      serotype = serotype_label,
+      dataset = dataset_label,
+      major_lineage = str_trim(major_lineage),
+      major_lineage = if_else(is.na(major_lineage) | major_lineage == "", "Unknown lineage", major_lineage),
+      sample_year = extract_decimal_year(.data[[date_col]]),
+      year = floor(sample_year)
+    ) %>%
+    select(dataset, serotype, sequence_id, country, genotype, major_lineage, sample_year, year, everything())
+}
+```
+
+# Import metadata
+
+```{r import-metadata}
+metadata_df <- purrr::pmap_dfr(
+  metadata_files,
+  function(serotype, dataset, file_stem, file_path) {
+    read_metadata_file(file_path, serotype, dataset)
+  }
+) %>%
+  mutate(
+    dataset = factor(dataset, levels = dataset_levels),
+    serotype = factor(serotype, levels = serotype_levels)
+  ) %>%
+  filter(!is.na(year))
+
+metadata_df %>%
+  count(serotype, dataset, name = "n_sequences") %>%
+  arrange(serotype, dataset) %>%
+  knitr::kable()
+```
+
+# Diagnostic checks for impossible or suspicious subsampling detections
+
+These checks are meant to catch cases where the subsampled metadata contains bins that are not represented in the full metadata, or where a subsampled bin has more genomes than the corresponding full bin. A few early-year bars can look more visible in the subsampled panel because the y-axis is smaller, but they should still be present in the full dataset.
+
+```{r subsampling-diagnostics}
+full_bins <- metadata_df %>%
+  filter(dataset == "Full dataset") %>%
+  count(serotype, year, major_lineage, name = "full_n")
+
+sampled_bins <- metadata_df %>%
+  filter(dataset == "Subsampled dataset") %>%
+  count(serotype, year, major_lineage, name = "sampled_n")
+
+subsampled_bin_check <- sampled_bins %>%
+  full_join(full_bins, by = c("serotype", "year", "major_lineage")) %>%
+  mutate(
+    full_n = dplyr::coalesce(full_n, 0L),
+    sampled_n = dplyr::coalesce(sampled_n, 0L),
+    issue = case_when(
+      sampled_n > 0 & full_n == 0 ~ "Subsampled bin absent from full dataset",
+      sampled_n > full_n ~ "Subsampled bin count exceeds full dataset",
+      TRUE ~ "OK"
+    )
+  ) %>%
+  filter(issue != "OK") %>%
+  arrange(serotype, year, major_lineage)
+
+if (nrow(subsampled_bin_check) == 0) {
+  cat("No impossible serotype-year-lineage bins detected: every subsampled bin is present in the full dataset and sampled counts do not exceed full counts.\n")
+} else {
+  knitr::kable(subsampled_bin_check)
+}
+
+# Extra check for early-year detections that may visually appear only in the subsampled panel.
+early_year_cutoff <- 1990
+
+early_year_check <- sampled_bins %>%
+  filter(year < early_year_cutoff) %>%
+  left_join(full_bins, by = c("serotype", "year", "major_lineage")) %>%
+  mutate(full_n = dplyr::coalesce(full_n, 0L)) %>%
+  arrange(serotype, year, major_lineage)
+
+cat("\nEarly-year subsampled bins before", early_year_cutoff, ". These should also have full_n > 0.\n\n")
+knitr::kable(early_year_check)
+```
+
+# Prepare major-lineage groups
+
+Lineages with fewer than `r lineage_min_n` genomes in the full dataset for that serotype are collapsed into `Other lineages`. Set `lineage_min_n <- 1` in the setup chunk to show every lineage.
+
+```{r prepare-lineage-data}
+lineage_keep <- metadata_df %>%
+  filter(dataset == "Full dataset", !is.na(major_lineage), major_lineage != "", major_lineage != "Unknown lineage") %>%
+  count(serotype, major_lineage, name = "total_n") %>%
+  filter(total_n >= lineage_min_n)
+
+lineage_plot_df <- metadata_df %>%
+  filter(!is.na(major_lineage), major_lineage != "", major_lineage != "Unknown lineage") %>%
+  left_join(lineage_keep %>% mutate(keep_lineage = TRUE), by = c("serotype", "major_lineage")) %>%
+  mutate(
+    lineage_plot = if_else(!is.na(keep_lineage) & keep_lineage, major_lineage, lineage_other_label),
+    lineage_group = extract_lineage_group(lineage_plot),
+    serotype_label = recode(as.character(serotype), !!!serotype_labels),
+    panel = paste0(serotype_label, " | ", dataset),
+    panel = factor(
+      panel,
+      levels = as.vector(t(outer(unname(serotype_labels[serotype_levels]), dataset_levels, paste, sep = " | ")))
+    )
+  ) %>%
+  count(serotype, serotype_label, dataset, panel, year, lineage_plot, lineage_group, name = "n")
+
+lineage_levels <- lineage_plot_df %>%
+  group_by(lineage_plot) %>%
+  summarise(total_n = sum(n), .groups = "drop") %>%
+  arrange(desc(total_n)) %>%
+  pull(lineage_plot)
+lineage_levels <- c(setdiff(lineage_levels, lineage_other_label), intersect(lineage_other_label, lineage_levels))
+
+year_breaks <- make_shared_breaks(lineage_plot_df$year, n = 10)
+
+lineage_plot_df <- lineage_plot_df %>%
+  mutate(lineage_plot = factor(lineage_plot, levels = lineage_levels))
+
+lineage_plot_df %>%
+  count(serotype_label, dataset, name = "n_year_lineage_bins") %>%
+  knitr::kable()
+```
+
+# Figure: temporal sampling counts colored by major lineage
+
+Each serotype is plotted as a paired full-versus-subsampled panel. Within each serotype, lineages from the same genotype group use related shades.
+
+```{r major-lineage-count-figure, fig.width=8.27, fig.height=11.69}
+make_serotype_lineage_plot <- function(st) {
+  st_df <- lineage_plot_df %>%
+    filter(serotype == st) %>%
+    mutate(
+      dataset = factor(as.character(dataset), levels = dataset_levels),
+      lineage_plot = droplevels(lineage_plot)
+    )
+
+  st_lineage_levels <- st_df %>%
+    group_by(lineage_plot) %>%
+    summarise(total_n = sum(n), .groups = "drop") %>%
+    mutate(
+      lineage_group = extract_lineage_group(as.character(lineage_plot)),
+      is_other = as.character(lineage_plot) == lineage_other_label
+    ) %>%
+    arrange(is_other, lineage_group, desc(total_n), as.character(lineage_plot)) %>%
+    pull(lineage_plot) %>%
+    as.character()
+
+  st_colors <- make_grouped_lineage_palette(st_lineage_levels, other_name = lineage_other_label)
+  st_breaks <- make_shared_breaks(st_df$year, n = 8)
+  st_label <- serotype_labels[[as.character(st)]]
+
+  st_df <- st_df %>%
+    mutate(lineage_plot = factor(as.character(lineage_plot), levels = st_lineage_levels))
+
+  ggplot(st_df, aes(x = year, y = n, fill = lineage_plot)) +
+    geom_col(width = 0.95, color = NA) +
+    facet_wrap(~ dataset, ncol = 2, scales = "free_y") +
+    scale_fill_manual(values = st_colors, drop = FALSE) +
+    scale_x_continuous(
+      breaks = st_breaks,
+      expand = expansion(mult = c(0.005, 0.01))
+    ) +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.10))) +
+    labs(
+      title = st_label,
+      x = "Collection year",
+      y = "Number of genomes"
+    ) +
+    base_sampling_theme +
+    theme(
+      plot.title = element_text(face = "bold", size = 12, hjust = 0),
+      legend.position = c(0.015, 0.965),
+      legend.justification = c(0, 1),
+      legend.direction = "vertical",
+      legend.background = element_rect(fill = scales::alpha("white", 0.78), color = NA),
+      legend.text = element_text(size = 10),
+      legend.key.size = unit(0.11, "cm"),
+      legend.spacing.x = unit(0.03, "cm"),
+      legend.spacing.y = unit(-0.02, "cm"),
+      legend.margin = margin(1, 1, 1, 1),
+      plot.margin = margin(2, 5, 2, 5)
+    ) +
+    guides(
+      fill = guide_legend(
+        ncol = 3,
+        byrow = FALSE,
+        override.aes = list(linewidth = 0, size = 1.8)
+      )
+    )
+}
+
+serotype_lineage_plots <- lapply(serotype_levels, make_serotype_lineage_plot)
+
+p_major_lineage_counts <- wrap_plots(serotype_lineage_plots, ncol = 1)
+
+p_major_lineage_counts
+```
+
+# Save figure
+
+```{r save-major-lineage-count-figure}
+png_path <- file.path(figure_output_dir, "DENV_all_serotypes_full_vs_subsampled_major_lineage_counts_by_year_grouped_shades.png")
+pdf_path <- file.path(figure_output_dir, "DENV_all_serotypes_full_vs_subsampled_major_lineage_counts_by_year_grouped_shades.pdf")
+
+ggsave(png_path, p_major_lineage_counts, width = 8.27, height = 11.69, dpi = 600)
+ggsave(pdf_path, p_major_lineage_counts, width = 8.27, height = 11.69)
+
+tibble(output = c("PNG", "PDF"), path = c(png_path, pdf_path)) %>%
+  knitr::kable()
+```
+
+# Collapse check
+
+```{r collapse-check}
+lineage_collapse_check <- metadata_df %>%
+  filter(dataset == "Full dataset", !is.na(major_lineage), major_lineage != "", major_lineage != "Unknown lineage") %>%
+  count(serotype, major_lineage, name = "total_n") %>%
+  mutate(plot_group = if_else(total_n >= lineage_min_n, major_lineage, lineage_other_label)) %>%
+  count(serotype, plot_group, name = "n_lineages") %>%
+  filter(plot_group == lineage_other_label)
+
+cat("Lineage groups collapsed using strict n <", lineage_min_n, "within the full dataset for each serotype.\n\n")
+knitr::kable(lineage_collapse_check)
+```
