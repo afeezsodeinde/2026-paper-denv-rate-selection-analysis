@@ -1,0 +1,356 @@
+---
+title: "DENV selection site barcode plot"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Load packages
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(scales)
+```
+
+## Read and combine datasets
+
+```{r}
+files <- c(
+  "DENV1_combined_sites.csv",
+  "DENV2_combined_sites.csv",
+  "DENV3_combined_sites.csv",
+  "DENV4_combined_sites.csv"
+)
+
+serotypes <- c("DENV1", "DENV2", "DENV3", "DENV4")
+
+df_list <- lapply(seq_along(files), function(i) {
+  read_csv(files[i], show_col_types = FALSE) %>%
+    mutate(serotype = serotypes[i])
+})
+
+all_sites <- bind_rows(df_list)
+```
+
+## Inspect gene names
+
+```{r}
+unique(all_sites$gene)
+```
+
+## Clean gene labels
+
+```{r}
+all_sites <- all_sites %>%
+  mutate(
+    gene_clean = case_when(
+      grepl("capsid", gene, ignore.case = TRUE) ~ "C",
+      grepl("prM|membrane", gene, ignore.case = TRUE) ~ "prM",
+      grepl("envelope", gene, ignore.case = TRUE) ~ "E",
+      grepl("NS1", gene, ignore.case = TRUE) ~ "NS1",
+      grepl("NS2A", gene, ignore.case = TRUE) ~ "NS2A",
+      grepl("NS2B", gene, ignore.case = TRUE) ~ "NS2B",
+      grepl("NS3", gene, ignore.case = TRUE) ~ "NS3",
+      grepl("NS4A", gene, ignore.case = TRUE) ~ "NS4A",
+      grepl("NS4B", gene, ignore.case = TRUE) ~ "NS4B",
+      grepl("NS5|polymerase", gene, ignore.case = TRUE) ~ "NS5",
+      TRUE ~ gene
+    )
+  )
+
+gene_order <- c("C", "prM", "E", "NS1", "NS2A", "NS2B", "NS3", "NS4A", "NS4B", "NS5")
+
+all_sites <- all_sites %>%
+  mutate(
+    gene_clean = factor(gene_clean, levels = gene_order),
+    serotype = factor(serotype, levels = c("DENV1", "DENV2", "DENV3", "DENV4"))
+  )
+```
+
+## Build plotting dataframe
+
+This version keeps significant FEL calls in one `FEL` column, using color to distinguish FEL- and FEL+. FEL neutral calls are removed because they are not significant selection sites. FEL+ is also duplicated into a separate adjacent `FEL+` column for emphasis, but both FEL+ displays use the same legend category and color.
+
+```{r}
+fel_all <- all_sites %>%
+  filter(fel_selection %in% c("negative", "positive")) %>%
+  transmute(
+    serotype,
+    gene_clean,
+    site,
+    method = "FEL",
+    signal = case_when(
+      fel_selection == "negative" ~ "FEL-",
+      fel_selection == "positive" ~ "FEL+"
+    )
+  )
+
+fel_pos_focus <- all_sites %>%
+  filter(fel_selection == "positive") %>%
+  transmute(
+    serotype,
+    gene_clean,
+    site,
+    method = "FEL+",
+    signal = "FEL+"
+  )
+
+meme_sig <- all_sites %>%
+  filter(!is.na(meme_qval), meme_qval < 0.2) %>%
+  transmute(
+    serotype,
+    gene_clean,
+    site,
+    method = "MEME",
+    signal = "MEME"
+  )
+
+prime_sig <- all_sites %>%
+  filter(!is.na(prime_marker), prime_marker != "-") %>%
+  transmute(
+    serotype,
+    gene_clean,
+    site,
+    method = "PRIME",
+    signal = "PRIME"
+  )
+
+plot_df <- bind_rows(fel_all, fel_pos_focus, meme_sig, prime_sig) %>%
+  mutate(
+    method = factor(method, levels = c("FEL", "FEL+", "MEME", "PRIME")),
+    method_num = as.numeric(method),
+    gene_clean = factor(gene_clean, levels = gene_order),
+    serotype = factor(serotype, levels = c("DENV1", "DENV2", "DENV3", "DENV4"))
+  )
+```
+
+## Check that data are present
+
+```{r}
+table(plot_df$method, plot_df$signal, useNA = "ifany")
+head(plot_df)
+```
+
+## Axis breaks by protein
+
+Capsid is short, so the y-axis is manually set to avoid crowding with 25 and 75.
+
+```{r}
+protein_breaks <- list(
+  C    = c(1, 50, 100),
+  prM  = c(1, 50, 100, 166),
+  E    = c(1, 100, 200, 300, 400, 495),
+  NS1  = c(1, 100, 200, 300, 352),
+  NS2A = c(1, 50, 100, 150, 218),
+  NS2B = c(1, 50, 130),
+  NS3  = c(1, 200, 400, 618),
+  NS4A = c(1, 50, 100, 150),
+  NS4B = c(1, 100, 200, 248),
+  NS5  = c(1, 300, 600, 900)
+)
+
+protein_scales <- lapply(names(protein_breaks), function(prot) {
+  scale_y_reverse(
+    breaks = protein_breaks[[prot]],
+    name = "Site position"
+  )
+})
+names(protein_scales) <- names(protein_breaks)
+```
+
+## Plot selection sites
+
+```{r fig.width=13, fig.height=16}
+# Install ggh4x if needed:
+# install.packages("ggh4x")
+
+if (!requireNamespace("ggh4x", quietly = TRUE)) {
+  stop("Please install ggh4x first: install.packages('ggh4x')")
+}
+
+p <- ggplot(
+  plot_df,
+  aes(
+    x = method_num,
+    y = site,
+    color = signal
+  )
+) +
+  geom_segment(
+    data = plot_df %>% filter(signal == "FEL+"),
+    aes(
+      x = method_num - 0.33,
+      xend = method_num + 0.33,
+      y = site,
+      yend = site
+    ),
+    color = "black",
+    linewidth = 0.85,
+    inherit.aes = FALSE
+  ) +
+  geom_segment(
+    aes(
+      x = method_num - 0.32,
+      xend = method_num + 0.32,
+      y = site,
+      yend = site
+    ),
+    linewidth = 0.65,
+    lineend = "butt"
+  ) +
+  facet_grid(
+    rows = vars(gene_clean),
+    cols = vars(serotype),
+    scales = "free_y",
+    space = "free_y",
+    switch = "y"
+  ) +
+  ggh4x::facetted_pos_scales(
+    y = protein_scales
+  ) +
+  scale_x_continuous(
+    breaks = seq_along(levels(plot_df$method)),
+    labels = levels(plot_df$method),
+    expand = expansion(mult = c(0.08, 0.08))
+  ) +
+  scale_color_manual(
+    values = c(
+      "FEL-" = "#0072B2",
+      "FEL+" = "#D55E00",
+      "MEME" = "#E69F00",
+      "PRIME" = "#009E73"
+    ),
+    breaks = c("FEL-", "FEL+", "MEME", "PRIME"),
+    labels = c("FEL negative", "FEL positive", "MEME", "PRIME")
+  ) +
+  labs(
+    x = NULL,
+    y = "Site position"
+  ) +
+  theme_bw(base_size = 18) +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.x = element_text(face = "bold", size = 18),
+    strip.text.y.left = element_text(face = "bold", size = 18, angle = 0),
+    axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 15),
+    axis.title.y = element_text(size = 18),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 15),
+    legend.position = "right",
+    panel.spacing.x = unit(0.7, "lines"),
+    panel.spacing.y = unit(0.9, "lines")
+  )
+
+p
+```
+
+## Save plot
+
+```{r}
+ggsave(
+  "DENV_selection_barcode_plot_flipped_FEL_single_legend.png",
+  plot = p,
+  width = 13,
+  height = 16,
+  dpi = 600
+)
+
+ggsave(
+  "DENV_selection_barcode_plot_flipped_FEL_single_legend.pdf",
+  plot = p,
+  width = 13,
+  height = 16,
+  device = cairo_pdf
+)
+```
+
+## Optional: individual protein plots
+
+```{r eval=FALSE}
+for (prot in gene_order) {
+  prot_df <- plot_df %>%
+    filter(gene_clean == prot)
+
+  p_prot <- ggplot(
+    prot_df,
+    aes(x = method_num, y = site, color = signal)
+  ) +
+    geom_segment(
+      data = prot_df %>% filter(signal == "FEL+"),
+      aes(
+        x = method_num - 0.33,
+        xend = method_num + 0.33,
+        y = site,
+        yend = site
+      ),
+      color = "black",
+      linewidth = 0.85,
+      inherit.aes = FALSE
+    ) +
+    geom_segment(
+      aes(
+        x = method_num - 0.32,
+        xend = method_num + 0.32,
+        y = site,
+        yend = site
+      ),
+      linewidth = 0.65,
+      lineend = "butt"
+    ) +
+    facet_grid(
+      rows = vars(gene_clean),
+      cols = vars(serotype),
+      scales = "free_y",
+      space = "free_y",
+      switch = "y"
+    ) +
+    scale_y_reverse(
+      breaks = if (prot == "C") c(1, 50, 100) else waiver(),
+      name = "Site position"
+    ) +
+    scale_x_continuous(
+      breaks = seq_along(levels(plot_df$method)),
+      labels = levels(plot_df$method),
+      expand = expansion(mult = c(0.08, 0.08))
+    ) +
+    scale_color_manual(
+      values = c(
+        "FEL-" = "#0072B2",
+        "FEL+" = "#D55E00",
+        "MEME" = "#E69F00",
+        "PRIME" = "#009E73"
+      )
+    ) +
+    labs(x = NULL, y = "Site position") +
+    theme_bw(base_size = 18) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      strip.text.x = element_text(face = "bold", size = 18),
+      strip.text.y.left = element_text(face = "bold", size = 18, angle = 0),
+      axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 15),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 15),
+      legend.position = "right"
+    )
+
+  print(p_prot)
+
+  ggsave(
+    filename = paste0("Blownup_", prot, "_selection_plot_flipped_FEL_focus.png"),
+    plot = p_prot,
+    width = 10,
+    height = 8,
+    dpi = 600
+  )
+}
+```
